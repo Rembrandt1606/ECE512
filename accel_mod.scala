@@ -1,171 +1,207 @@
 class PFModuleMemImp(outer: PFExampleMem)(implicit p: Parameters) extends LazyRoCCModuleImp(outer)
   with HasCoreParameters
  {
-//val cacheParams = tileParams.dcache.get
-//val busy = RegInit(VecInit(Seq.fill(outer.n){false.B}))
-val busy = Reg(Bool())
-val regfile = Mem(outer.n, UInt(64.W))
-val regSHR = RegInit(VecInit(Seq.fill(outer.n)(0.U(2.W)))) // Status Handeling Register File
- // TWO bits:
-// bit 1 is valid bit (has this data been used), if 1 data needs to be replaced
-// bit 2 is src array tag, and is equal to log2Ciel(num_sources_vectors). This is needed due to out of order responses from memory interface
-val file_full = Reg(Bool())
-val has_valid_data = Reg(Bool())
-// Floating Point Addition Module
-val fpAdder = Module(new AddRecFN(outer.expWidth, outer.sigWidth))
-val fpAddSHR = Reg(UInt(5.W)) // Add Status Handling Register
+// Define internal routing 
+    val rocc_interal = Wire(new Bundle {
+
+        val in_data_1  = Flipped(Decoupled(UInt(64.W)))
+        val out_data_1 = Decoupled(UInt(64.W))
+        val in_data_2  = Flipped(Decoupled(UInt(64.W)))
+        val out_data_2 = Decoupled(UInt(64.W))
+
+        val in_data_w  = Flipped(Decoupled(UInt(64.W)))
+        val out_data_w = Decoupled(UInt(64.W))
+    })
+// Input fifos to floating point units 
+val i_fifo_1 = Queue(rocc_interal.in_data_1, 3)
+val i_fifo_2 = Queue(rocc_interal.in_data_2, 3)
+// writeback fifo
+val w_fifo = Queue(rocc_interal.in_data_w, 3)
+
+// Connect queues 
+rocc_interal.out_data_1 <> i_fifo_1
+rocc_interal.out_data_2 <> i_fifo_2
+rocc_interal.out_data_w <> w_fifo
+
+// Define floating point modules 
+// Floating Point Addition Module (1 cycle)
+val fpAdder  = Module(new AddRecFN(outer.expWidth, outer.sigWidth))
+val fpAddSHR = Reg(UInt(5.W)) // Add Exceptiontion Handling Register
+
+// Floating POint Division/Squart Module (~20 - 64 cycles)
+val fpDiv    = Module(new DivSqrtRecFN_small(outer.expWidth, outer.sigWidth, 0))
+val fpDivSHR = Reg(UInt(5.W)) // Div Exceptiontion Handling Register
+
 // Floating Point Multiply Accumulate Module
-//val fpMAC = Module(new MulAddRecFN(outer.expWidth, outer.sigWidth))
-//val fpMACSHR = Reg(UInt(5.W)) // MAC Status Handling Register
- 
-val fpDiv = Module(new DivSqrtRecFN_small(outer.expWidth, outer.sigWidth, 0))
-val fpDivSHR = Reg(UInt(5.W))
-// CumSum Instruciton
+val fpMAC    = Module(new MulAddRecFN(outer.expWidth, outer.sigWidth))
+val fpMACSHR = Reg(UInt(5.W)) // MAC Exceptiontion Handling Register
+
+// CURRENT ITERATION OF CUSTOM INSTRUCTIONS
+// Run Sum Instruciton
 // ------------------------------------
-// funct7  --> 0
+// funct   --> 0
 // rs2     --> contains lenght of array to cumlative sum over
 // rs1     --> contains ptr to start address
 // xd      --> set to 1, core waits for response
 // xs1/xs2 --> set to 1, are using both rs1 and rs2
 // rd      --> location to send cumlative sum
-// opcode  --> 01
-// ------------------------------------
+// opcode  --> 00
 //
 // Read Divide Write Instruction
-// funct7  --> 1
+// ------------------------------------
+// funct  --> 1
 // rs2     --> Not Used
 // rs1     --> contains ptr to weights
 // xd      --> set to 0, core does not wait for response (need to ASM after)
 // xs1/xs2 --> set to 0, are not using both rs1 and rs2
 // rd      --> location to send done signal
-// opcode  --> 01
+// opcode  --> 00
+//
+// Multiply Accumulate Instruction
+// ------------------------------------
+// Multiply Accumulate c += (b x a) NOTE: a is weights[x], address should be presesnt in co-processor already
+// funct   --> 2
+// rs2     --> contains ptr to a in memory 
+// rs1     --> contains ptr to b in memory 
+// xd      --> set to 1, core waits for response
+// xs1/xs2 --> set to 1, are using both rs1 and rs2
+// rd      --> location to send c
+// opcode  --> 00
+
 // ========================= CORE INPUT INTERFACE ========================= //
-val core_cmd = Queue(io.cmd)                       // FIFO cmd from core
+val core_cmd      = Queue(io.cmd)                       // FIFO cmd from core
 val core_response = io.resp
-val mem_request = io.mem.req
-val rocc_funct = core_cmd.bits.inst.funct  // function from incoming RoCC instruction
-val rocc_rs2   = core_cmd.bits.rs2         // src1 register data
-val rocc_xd    = core_cmd.bits.inst.xd     // true if core needs reponse
-val rocc_rd    = core_cmd.bits.inst.rd     // destination register
-val rocc_rs1   = core_cmd.bits.rs1         // src2 register data
-val rocc_op    = core_cmd.bits.inst.opcode // 0x1 (acclerator ID = 1)
-val rocc_dprv  = core_cmd.bits.status.dprv // CSR content, needed for appropriate prilvages in cache
-val rocc_dv    = core_cmd.bits.status.dv   // NOT SURE
-val doCumSum = rocc_funct === 0.U          // When function is 0 we want to cumlative sum
-val doDiv  = rocc_funct === 1.U            // When function is 1 we want to multiply accumlate
-// Internal Registers
-val sum_weights = Reg(UInt(64.W))                  // To store double of sum weights
-val weights_start_addr = Reg(UInt(coreMaxAddrBits.W))   // start address in memory, contained in rs1 of op 0 (Weights Start Address in memory)
- 
-val curr_addr = Reg(UInt(coreMaxAddrBits.W))       // current address we are pulling from L1
-val curr_wb_addr = Reg(UInt(coreMaxAddrBits.W))    // current address we are writing back to
-val counter =  Reg(UInt(32.W))                     // counter for the number of addresses that have been accessed
-val write_counter = Reg(UInt(32.W))
-val array_size = Reg(UInt(32.W))                   // Stores current size of particle filter (n = 10000) in example
- 
-val resp_rd = Reg(chiselTypeOf(rocc_rd))           // return register ID
- 
-val a2_start_addr = Reg(UInt(coreMaxAddrBits.W))
-val a3_start_addr = Reg(UInt(coreMaxAddrBits.W))
- 
-val current_dprv = Reg(chiselTypeOf(rocc_dprv))
-val current_dv   = Reg(chiselTypeOf(rocc_dv))
-val finished     = Reg(Bool())
-val memRespTag = io.mem.resp.bits.tag(1,0)
-val memAddrOffset = RegInit(outer.precision.U(4.W)) //4 for 32 8.U for 64)
-val addr_tag = Reg(UInt(2.W))
-val addr_access_tag = Reg(UInt(2.W))
-val rocc_busy = Reg(Bool())
-// s_idle    --> awaiting an incoming op (can we clock gate)
-// s_acquire --> request to access memory location
-// s_grant   --> request granted at memory location
-// s_sum     --> adding incoming value to cumSum
-// s_retrun  --> return computed cumlative sum
-//val s_idle :: s_wait :: s_grant :: s_acquire_more :: s_sum :: s_return :: Nil = Enum(7)
+val mem_request   = io.mem.req
+val rocc_funct    = core_cmd.bits.inst.funct  // function from incoming RoCC instruction
+val rocc_rs2      = core_cmd.bits.rs2         // src1 register data
+val rocc_xd       = core_cmd.bits.inst.xd     // true if core needs reponse
+val rocc_rd       = core_cmd.bits.inst.rd     // destination register
+val rocc_rs1      = core_cmd.bits.rs1         // src2 register data
+val rocc_op       = core_cmd.bits.inst.opcode // 0x1 (acclerator ID = 1)
+val rocc_dprv     = core_cmd.bits.status.dprv // CSR content, needed for appropriate prilvages in cache
+val rocc_dv       = core_cmd.bits.status.dv   // NOT SURE
+val doCumSum      = rocc_funct === 0.U        // When function is 0 we want to cumlative sum
+val doDiv         = rocc_funct === 1.U        // When function is 1 we want to writeback divide
+val doMAC         = rocc_funct === 2.U        // When function is 2 we want to multiply accumlate
+// ======================================================================== //
+
+// =========== Pipeline states =========== //
+// Memory interface limitation, can not read/write at same time
+// limited to 64 bits total access at a time, meaning we can access 2 floats but only 1 double 
 val m_idle :: m_wait :: m_stream_read1 :: m_writeback :: m_w_wait :: Nil = Enum(5)
 val r_idle :: r_busy :: r_return :: Nil = Enum(3)
-val c_idle :: c_add :: c_div :: c_wait_div :: Nil = Enum(4)
+val c_idle :: c_add :: c_div :: c_wait_div :: c_mac :: Nil = Enum(5)
+
+val comp_state  = RegInit(c_idle)
+val mem_state   = RegInit(m_idle)
+val rocc_state  = RegInit(r_idle)
+// ================================================================ //
+// Internal Registers
+val rocc_busy = Reg(Bool())                             // is the co-processor busy
+
+val sum_weights        = Reg(UInt(64.W))                // to store double of sum weights
+val mac_total          = Reg(UInt(64.W))
+val weights_start_addr = Reg(UInt(coreMaxAddrBits.W))   // start address in memory, contained in rs1 of op 0 (Weights Start Address in memory)
  
-val comp_state = RegInit(c_idle)
-val mem_state = RegInit(m_idle)
-val rocc_state = RegInit(r_idle)
-val mem_finished = Reg(Bool())
-val mem_w_finished = Reg(Bool())
-val add_finished = Reg(Bool())
-val div_finished = Reg(Bool())
-val need_writeback = Reg(Bool())
-val writeback_data = Reg(UInt(64.W))
-val twoSRC = Reg(Bool())
-val writing = Reg(Bool())
-val sumWeights =  Reg(UInt(64.W))
-val curOp = Reg(UInt(2.W))
-// CORE INTERFACE CONTROL SIGNALS
+val curr_a_addr     = Reg(UInt(coreMaxAddrBits.W))      // current fifo 1 address we are pulling from L1
+val curr_b_addr     = Reg(UInt(coreMaxAddrBits.W))      // current fifo 2 address we are pulling from L1
+val curr_c_addr     = Reg(UInt(coreMaxAddrBits.W))      // current fifo 3 address we are pulling from L1
+val curr_wb_addr  = Reg(UInt(coreMaxAddrBits.W))        // current address we are writing back to
+val counter       =  Reg(UInt(32.W))                    // counter for the number of addresses that have been accessed
+val write_counter = Reg(UInt(32.W))                     // counter for the number of write address we have stored to
+val array_size    = Reg(UInt(32.W))                     // Stores current size of particle filter (n = 10000) in example
  
-// Define i_fifo_1 queues and IO
-val rocc_interal = Wire(new Bundle {
-   val in_data_1 = Flipped(Decoupled(UInt(64.W)))
-   val out_data_1 = Decoupled(UInt(64.W))
+val resp_rd = Reg(chiselTypeOf(rocc_rd))                // stores return register 
  
-   val in_data_w = Flipped(Decoupled(UInt(64.W)))
-   val out_data_w = Decoupled(UInt(64.W))
-})
+val c_start_addr = Reg(UInt(coreMaxAddrBits.W))         // stores c address for multiply accumulate c += (b x a)
+val b_start_addr = Reg(UInt(coreMaxAddrBits.W))         // stores b address for multiply accumulate c += (b x a)
  
-val i_fifo_1 = Queue(rocc_interal.in_data_1, 3)
- 
-val w_fifo = Queue(rocc_interal.in_data_w, 3)
- 
-rocc_interal.out_data_1 <> i_fifo_1
-rocc_interal.out_data_w <> w_fifo
- 
-core_cmd.ready := (!rocc_busy)           // Only ready in idle state
+val current_dprv = Reg(chiselTypeOf(rocc_dprv))         // L1 permission register (2b'11) for full access read/write
+val current_dv   = Reg(chiselTypeOf(rocc_dv))           // unsure what dv does, typically set to 0 (does this manage non-blocking cases?)                        
+
+val memAddrOffset = RegInit(outer.precision.U(4.W))     // 4.U for 32 bit 8.U for 64 bit)
+val addr_tag      = Reg(UInt(2.W))                      // tag of which memory operation this is
+val memRespTag = io.mem.resp.bits.tag(1,0)              // return tag of memory operation
+
+val mem_finished    =  Reg(Bool())                      // True we have completed all memory read requests needed for currenter operation
+val mem_w_finished  =  Reg(Bool())                      // True we have completed all memory write requests needed for currenter operation                      
+val add_finished    =  Reg(Bool())                      // True we have completed all memory additions needed for currenter operation
+val div_finished    =  Reg(Bool())                      // True we have completed all memory divisions needed for currenter operation
+val mac_finished    =  Reg(Bool())                      // True we have completed all memory macs needed for currenter operation
+
+val need_writeback  =  Reg(Bool())                      // Do we have data in the write queue that needs to be written back                   
+val twoSRC          =  Reg(Bool())                      // Are multiple data sources needed for this operation
+val src_array       =  Reg(UInt(1.W))
+val sumWeights      =  Reg(UInt(64.W))                  // Register to store sum weights after run_sum is completed
+val curOp           =  Reg(UInt(2.W))                   // Our current operation 00, 01, 10, 11
+
+
+// ==== core interface control signals ==== //
+core_cmd.ready := (!rocc_busy)                      // Only ready in idle state
 core_response.valid := (rocc_state === r_return)    // Valid return when in return state
-core_response.bits.rd := resp_rd               // always return the response to the correct address
-core_response.bits.data := sum_weights //fNFromRecFN(outer.expWidth, outer.sigWidth, testreg1)              // sematanics always return Cumlative Sum
 io.busy := rocc_busy
- io.mem.req.valid := false.B   // ((state === s_acquire || state === s_acquire_more)
-  // && !busy && !(curr_addr === end_addr || counter >= 10.U))  // Valid request when we are attempting to aquire
-writing := false.B
+
+// Internal control signals
 mem_finished := (counter === array_size && rocc_busy)
 mem_w_finished := (write_counter === array_size && rocc_busy)
 add_finished := (mem_finished && !i_fifo_1.valid && comp_state =/= c_add && curOp === 0.U)
 div_finished := (mem_finished && !i_fifo_1.valid && mem_w_finished && curOp === 1.U)
- 
+mac_finished := (mem_finished && !i_fifo_1.valid && !i_fifo_2.valid && comp_state =/= c_mac && curOp === 2.U)
+need_writeback := rocc_interal.out_data_w.valid
+// ================================================================ //
+// ============ INITALIZE FP HARDWARE ============ // 
+
 fpAdder.io.subOp := false.B
-fpAdder.io.a := 0.U // Mux(state === s_sum, testreg1, 0.U)
-fpAdder.io.b := 0.U // Mux(state === s_sum, recFNFromFN(outer.expWidth, outer.sigWidth, sum_weights), 0.U)
-fpAdder.io.roundingMode := 0.U // TO NEAREST FP
+fpAdder.io.a := 0.U 
+fpAdder.io.b := 0.U 
+fpAdder.io.roundingMode := 0.U          
 fpAdder.io.detectTininess := false.B
 fpAddSHR := fpAdder.io.exceptionFlags
  
  
 fpDiv.io.sqrtOp := false.B
-fpDiv.io.roundingMode := 0.U
-fpDivSHR := fpDiv.io.exceptionFlags//Cat(fpDiv.io.roundingModeOut, Cat(fpDiv.io.invalidExc.asUInt, fpDiv.io.infiniteExc.asUInt)) // Output status after FP Div
+fpDiv.io.roundingMode := 0.U          
+fpDiv.io.a := 0.U
+fpDiv.io.b := 0.U
+fpDivSHR := fpDiv.io.exceptionFlags
 fpDiv.io.detectTininess := false.B
 fpDiv.io.inValid := false.B
- // ============================================
- // INITALIZE SO CHISLE DOESNT COMPLAIN
+
+fpMAC.io.op := 0.U
+fpMAC.io.a := 0.U
+fpMAC.io.b := 0.U
+fpMAC.io.c := 0.U
+fpMAC.io.roundingMode := 0.U
+fpMAC.io.detectTininess := false.B
+fpMACSHR := fpMAC.io.exceptionFlags
+// =============================================== //
+
+// ============ INITALIZE SO CHISEL DOESN"T COMPLAIN ============ // 
 rocc_interal.in_data_1.bits := 0.U        
 rocc_interal.out_data_1.ready := false.B
 rocc_interal.in_data_1.valid := false.B
-rocc_interal.in_data_w.bits := fNFromRecFN(outer.expWidth, outer.sigWidth, fpDiv.io.out)
+rocc_interal.in_data_2.bits := 0.U        
+rocc_interal.out_data_2.ready := false.B
+rocc_interal.in_data_2.valid := false.B
 rocc_interal.in_data_w.valid := fpDiv.io.outValid_div
-need_writeback := rocc_interal.out_data_w.valid
+rocc_interal.in_data_w.bits := 0.U
 rocc_interal.out_data_w.ready := false.B
 
-fpDiv.io.a := 0.U
-fpDiv.io.b := 0.U
-// ===============================================================================
-// When we have a valid core command inc and it is compute cummulative sum
+io.mem.req.valid := false.B 
+core_response.bits.rd := resp_rd                    
+core_response.bits.data := 0.U           
+// ============================================================== // 
+
+// CO-PROCESSOR STATE
 switch(rocc_state) {
     is(r_idle)
     {
         when(core_cmd.fire() && !rocc_busy){
             when(doCumSum){
+
                weights_start_addr := rocc_rs1
                array_size := rocc_rs2
-               curr_addr := rocc_rs1
-               // Initalize interal registers
+               curr_a_addr := rocc_rs1
                counter := 0.U
                sumWeights := 0.U
                sum_weights := 0.U
@@ -175,13 +211,12 @@ switch(rocc_state) {
                current_dv   := rocc_dv
                resp_rd := rocc_rd
                twoSRC := false.B
-               //need_writeback := false.B
                rocc_state := r_busy
                rocc_busy := true.B
  
             }.elsewhen(doDiv) {
  
-               curr_addr := rocc_rs1
+               curr_a_addr := rocc_rs1
                current_dprv := rocc_dprv
                current_dv   := rocc_dv
                curr_wb_addr := rocc_rs1
@@ -192,8 +227,22 @@ switch(rocc_state) {
                rocc_state := r_busy
                rocc_busy := true.B
                twoSRC := false.B
-               // need_writeback := true.B
- 
+
+            }elsewhen(doMAC){
+                
+                curr_a_addr := weights_start_addr
+                curr_b_addr := rocc_rs1
+                mac_total := 0.U
+                curOp := 2.U
+                coutner := 0.U
+                src_array := 0.U
+                current_dprv := rocc_dprv
+                current_dv   := rocc_dv
+                resp_rd := rocc_rd
+                rocc_state := r_busy
+                rocc_busy := true.B
+                twoSRC := true.B
+
             }.otherwise{
               rocc_busy := false.B
             }
@@ -207,17 +256,19 @@ switch(rocc_state) {
       {
         rocc_state := r_idle
         rocc_busy := false.B
+      }.elsewhen(mac_finished && curOp === 2.U)
+      {
+          rocc_state := r_return // ** MODIFY RETURN LOGIC ** //
       }
       .otherwise{
         rocc_state := r_busy
       }
     }
 }
-// Memory Interface Read Controller
+
+// =========== MEMORY INTERFACE STATE =========== //
 switch(mem_state){
    is(m_idle){
-       // When we want to do work and i_fifo_1 queue is not full
-       //memData := 0.U
        val read_ready = rocc_busy
        when(read_ready){
          // Send out read request
@@ -235,7 +286,42 @@ switch(mem_state){
        {
            when(twoSRC) // Special case for two source arrays needed for multiply accumulate
            {
-               // TODO
+               when(src_array === 0.U)
+               { // Pull from source 1 array
+    
+                    io.mem.req.valid := rocc_interal.in_data_1.ready
+                    io.mem.req.bits.dprv := current_dprv
+                    io.mem.req.bits.dv := current_dv
+                    io.mem.req.bits.addr := curr_a_addr
+                    io.mem.req.bits.tag := addr_tag
+                    io.mem.req.bits.cmd := M_XRD // load
+                    io.mem.req.bits.size := log2Ceil(outer.precision).U  // 64 bits
+                    when(io.mem.req.valid && io.mem.req.ready) { // When we send off the request
+                        addr_tag := addr_tag + 1.U // iterate the address we want to access
+                        // We only iterate counter when both sources are here
+                        mem_state := m_wait // wait for response
+                        curr_a_addr := curr_a_addr + memAddrOffset
+                    }.otherwise{
+                        mem_state := m_stream_read1 // stay in read 1 state
+                    }
+               }.elsewhen(src_array === 1.U){
+                   
+                    io.mem.req.valid := rocc_interal.in_data_2.ready
+                    io.mem.req.bits.dprv := current_dprv
+                    io.mem.req.bits.dv := current_dv
+                    io.mem.req.bits.addr := curr_b_addr
+                    io.mem.req.bits.tag := addr_tag
+                    io.mem.req.bits.cmd := M_XRD // load
+                    io.mem.req.bits.size := log2Ceil(outer.precision).U  // 64 bits
+                    when(io.mem.req.valid && io.mem.req.ready) { // When we send off the request
+                        addr_tag := addr_tag + 1.U // iterate the address we want to access
+                        counter := counter + 1.U // iterate the counter
+                        mem_state := m_wait // wait for response
+                        curr_b_addr := curr_b_addr + memAddrOffset
+                    }.otherwise{
+                        mem_state := m_stream_read1 // stay in read 1 state
+                    }
+               }
            }
            .otherwise // If one source array
            {
@@ -243,7 +329,7 @@ switch(mem_state){
                io.mem.req.valid := rocc_interal.in_data_1.ready
                io.mem.req.bits.dprv := current_dprv
                io.mem.req.bits.dv := current_dv
-               io.mem.req.bits.addr := curr_addr
+               io.mem.req.bits.addr := curr_a_addr
                io.mem.req.bits.tag := addr_tag
                io.mem.req.bits.cmd := M_XRD // load
                io.mem.req.bits.size := log2Ceil(outer.precision).U  // 64 bits
@@ -251,7 +337,7 @@ switch(mem_state){
                    addr_tag := addr_tag + 1.U // iterate the address we want to access
                    counter := counter + 1.U // iterate the counter
                    mem_state := m_wait // wait for response
-                   curr_addr := curr_addr + memAddrOffset
+                   curr_a_addr := curr_a_addr + memAddrOffset
                }.otherwise{
                    mem_state := m_stream_read1 // stay in read 1 state
                }
@@ -268,13 +354,7 @@ switch(mem_state){
       // when(!writing && counter < array_size) // When we are not writing and counter is less than the size of the array
       when((write_counter < array_size))
        {              
-           when(twoSRC) // Special case for two source arrays needed for multiply accumulate
-           {
-               // TODO
-           }
-           .otherwise // If one source array
-           {
-               // send our memory request
+              // send our memory request
                io.mem.req.valid := rocc_interal.out_data_w.ready
                io.mem.req.bits.dprv := current_dprv
                io.mem.req.bits.dv := current_dv
@@ -302,13 +382,38 @@ switch(mem_state){
  
    is(m_wait){
      io.mem.req.valid := false.B
-     when(io.mem.resp.valid){ // If reponse has come in assign incoming data to reg file and goto sum
-       rocc_interal.in_data_1.valid := true.B
-       rocc_interal.in_data_1.bits := io.mem.resp.bits.data
-       mem_state := m_stream_read1
-     }.otherwise {
-       mem_state := m_wait
-     }
+     when(twoSRC) 
+    {
+        when(io.mem.resp.valid)
+        { 
+             when(src_array === 0.U) {
+                rocc_interal.in_data_1.valid := true.B
+                rocc_interal.in_data_1.bits := io.mem.resp.bits.data
+                mem_state := m_stream_read1
+                src_array := 1.U
+             }.elsewhen(src_array === 1.U){
+                rocc_interal.in_data_2.valid := true.B
+                rocc_interal.in_data_2.bits := io.mem.resp.bits.data
+                mem_state := m_stream_read1
+                src_array := 0.U
+             }
+
+        }.otherwise 
+        {
+            mem_state := m_wait
+        }
+    }.otherwise
+    {
+        when(io.mem.resp.valid)
+        { // If reponse has come in assign incoming data to reg file and goto sum
+                rocc_interal.in_data_1.valid := true.B
+                rocc_interal.in_data_1.bits := io.mem.resp.bits.data
+                mem_state := m_stream_read1
+        }.otherwise {
+                mem_state := m_wait
+        }
+    }
+
    }
    
    is(m_w_wait){
@@ -329,11 +434,14 @@ switch(comp_state){
    is(c_idle){
        val comp_add = (rocc_busy && !add_finished && rocc_interal.out_data_1.valid && curOp === 0.U)
        val comp_div = (rocc_busy && !div_finished && rocc_interal.out_data_1.valid && curOp === 1.U)
+       val comp_mac = (rocc_busy && !mac_finished && rocc_interal.out_data_1.valid && rocc_interal.out_data_2.valid && curOp === 2.U)
        when(comp_add)
         {
           comp_state := c_add
         }.elsewhen(comp_div){
           comp_state := c_div
+        }.elsewhen(comp_mac){
+          comp_state := c_mac
         }
          .otherwise{
            comp_state := c_idle
@@ -364,6 +472,7 @@ switch(comp_state){
    is(c_wait_div)
    {
      when(fpDiv.io.outValid_div){
+        rocc_interal.in_data_w.bits := fNFromRecFN(outer.expWidth, outer.sigWidth, fpDiv.io.out)
         when(rocc_interal.out_data_1.valid){
           comp_state := c_div
         }.otherwise{
@@ -372,19 +481,44 @@ switch(comp_state){
      }.otherwise{
        comp_state := c_wait_div
      }
+   }is(c_mac){
+       rocc_interal.out_data_1.ready := true.B
+       rocc_interal.out_data_2.ready := true.B
+       when(rocc_interal.out_data_1.fire() && rocc_interal.out_data_2.fire()){  // This may cause issues if we enter this state without out1 and out2 being valid
+            // c += (b x a)
+            fpMAC.io.c := recFNFromFN(outer.expWidth, outer.sigWidth, mac_total)
+            fpMAC.io.a := recFNFromFN(outer.expWidth, outer.sigWidth, rocc_interal.out_data_1.bits)
+            fpMAC.io.b := recFNFromFN(outer.expWidth, outer.sigWidth, rocc_interal.out_data_2.bits)
+            mac_total :=  fNFromRecFN(outer.expWidth, outer.sigWidth,fpMac.io.out)
+       }when(rocc_interal.out_data_1.valid && rocc_interal.out_data_2.valid){
+          comp_state := c_mac
+        }.otherwise{
+          comp_state := c_idle
+        }
    }
 }
  
 when (core_response.fire()) {
     rocc_state := r_idle
-    sumWeights := sum_weights
+    when(curOp === 0.U) 
+    {
+        sumWeights := sum_weights // Set internal register to completed sum for use later
+        core_response.bits.data := sum_weights
+    }
+    when(curOp === 2.U)
+    {
+        core_response.bits.data := mac_total
+    }
     rocc_busy := false.B
 }
-//
-io.interrupt := false.B
+
+// ====== CORE INTERFACE UNUSED ====== //
+io.interrupt := false.B // We do not need to interrupt the processor
+// =================================== //
+
 // =========================  MEMORY REQUEST UNUSED =========================== //
-io.mem.req.bits.signed := false.B
-//io.mem.req.bits.data := 0.U // we're not performing any stores...
-io.mem.req.bits.phys := false.B
-// ===================================================================== //
+io.mem.req.bits.signed := false.B   // Should not need
+io.mem.req.bits.phys   := false.B   // All acceses are virtual and should be translated
+// ========================================================+++++++============= //
 }
+
