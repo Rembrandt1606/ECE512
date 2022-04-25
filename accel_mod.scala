@@ -1,4 +1,3 @@
- 
 class PFModuleMemImp(outer: PFExampleMem)(implicit p: Parameters) extends LazyRoCCModuleImp(outer)
  with HasCoreParameters
 {
@@ -28,7 +27,7 @@ val expValues = new ArrayBuffer[UInt]
 // calcuate 1/N! for 0 to expApprox N's
 // N! = 1 * 2 * 3 * ... * N
  
-// Just going to hardcode this, could not get double to be cast to UInt otherwise
+// Just going to hardcoded LUT, could not get double to be cast to UInt otherwise
 expValues += (0x3FF0000000000000L).asUInt(64.W) // 1/0! = 1
 expValues += (0x3FF0000000000000L).asUInt(64.W) // 1/1! = 1
 expValues += (0x3FE0000000000000L).asUInt(64.W) // 1/2! = 0.5
@@ -37,7 +36,7 @@ expValues += (0x3FA55555555CA9D5L).asUInt(64.W) // 1/4! = 0.04166
 expValues += (0x3F811111110E2277L).asUInt(64.W) // 1/5! = 0.00833
  
  // Creating a look up table to simplify factorial division for e^x taylor series calcuation
- // Only 4th order is needed for 99.99% accruacy
+ // Only 4th order is needed for 99.99% accruacy (3rd order is 98% for 1 less cycle)
 val expLUT = VecInit(expValues)
 // Connect queues
 rocc_interal.out_data_1 <> i_fifo_1
@@ -46,22 +45,24 @@ rocc_interal.out_data_w <> w_fifo
  
 // === DEFINE FP MODULES === // 
 // Floating Point Addition Unit (1 cycle)
-val fpAdder  = Module(new AddRecFN(outer.expWidth, outer.sigWidth))
-val fpAddSHR = Reg(UInt(5.W)) // Add Exception Handling Register
+val fpAdder   = Module(new AddRecFN(outer.expWidth, outer.sigWidth))
+val fpAddSHR  = Reg(UInt(5.W)) // Add Exception Handling Register
  
 // Floating POint Division/Squart Unit (~20 - 64 cycles)
-val fpDiv    = Module(new DivSqrtRecFN_small(outer.expWidth, outer.sigWidth, 0))
-val fpDivSHR = Reg(UInt(5.W)) // Div Exception Handling Register
+val fpDiv     = Module(new DivSqrtRecFN_small(outer.expWidth, outer.sigWidth, 0))
+val fpDivSHR  = Reg(UInt(5.W)) // Div Exception Handling Register
  
 // Floating Point Multiply Accumulate Unit (1 cycle)
-val fpMAC    = Module(new MulAddRecFN(outer.expWidth, outer.sigWidth))
-val fpMACSHR = Reg(UInt(5.W)) // MAC Exception Handling Register
+val fpMAC     = Module(new MulAddRecFN(outer.expWidth, outer.sigWidth))
+val fpMACSHR  = Reg(UInt(5.W)) // MAC Exception Handling Register
  
 // Floating Point Multiply Unit (1 cycle) NOTE: e^y calculation will be multicycle 
-val fpMul    = Module(new MulRecFN(outer.expWidth, outer.sigWidth))
-val fpMulSHR = Reg(UInt(5.W)) // Mul Exception Handling Register
+val fpMul     = Module(new MulRecFN(outer.expWidth, outer.sigWidth))
+val fpMulSHR  = Reg(UInt(5.W)) // Mul Exception Handling Register
  
- 
+// Floating Point Multiply Unit (1 cycle) NOTE: e^y calculation will be multicycle 
+val fpMul2    = Module(new MulRecFN(outer.expWidth, outer.sigWidth))
+val fpMul2SHR = Reg(UInt(5.W)) // Mul Exception Handling Register
 // CURRENT ITERATION OF CUSTOM INSTRUCTIONS
 // Run Sum Instruciton
 // ------------------------------------
@@ -146,7 +147,7 @@ val curr_c_addr     = Reg(UInt(coreMaxAddrBits.W))      // current fifo 3 addres
 val curr_wb_addr  = Reg(UInt(coreMaxAddrBits.W))        // current address we are writing back to
 val counter       =  Reg(UInt(32.W))                    // counter for the number of addresses that have been accessed
 val write_counter = Reg(UInt(32.W))                     // counter for the number of write address we have stored to
-val array_size    = Reg(UInt(32.W))                     // Stores current size of particle filter (n = 10000) in example
+val array_size    = RegInit(10.U(32.W))                     // Stores current size of particle filter (n = 10000) in example
 val resp_rd = Reg(chiselTypeOf(rocc_rd))                // stores return register
 val c_start_addr = Reg(UInt(coreMaxAddrBits.W))         // stores c address for multiply accumulate c += (b x a)
 val b_start_addr = Reg(UInt(coreMaxAddrBits.W))         // stores b address for multiply accumulate c += (b x a)
@@ -162,7 +163,8 @@ val mem_w_finished  =  Reg(Bool())                      // True we have complete
 val add_finished    =  Reg(Bool())                      // True we have completed all memory additions needed for currenter operation
 val div_finished    =  Reg(Bool())                      // True we have completed all memory divisions needed for currenter operation
 val mac_finished    =  Reg(Bool())                      // True we have completed all memory macs needed for currenter operation
- 
+val exp_finished    =  Reg(Bool())
+
 val need_writeback  =  Reg(Bool())                      // Do we have data in the write queue that needs to be written back                  
 val twoSRC          =  Reg(Bool())                      // Are multiple data sources needed for this operation
 val src_array       =  Reg(UInt(1.W))
@@ -185,6 +187,7 @@ mem_w_finished := (write_counter === array_size && rocc_busy)
 add_finished := (mem_finished && !i_fifo_1.valid && comp_state =/= c_add && curOp === 0.U)
 div_finished := (mem_finished && !i_fifo_1.valid && mem_w_finished && curOp === 1.U)
 mac_finished := (mem_finished && !i_fifo_1.valid && !i_fifo_2.valid && comp_state =/= c_mac && curOp === 2.U)
+exp_finished := (mem_finished && !i_fifo_1.valid && mem_w_finished && curOp === 3.U)
 need_writeback := rocc_interal.out_data_w.valid
 // ================================================================ //
 // ============ INITALIZE FP HARDWARE ============ //
@@ -217,6 +220,13 @@ fpMul.io.b := 0.U
 fpMul.io.roundingMode := 0.U
 fpMul.io.detectTininess := false.B
 fpMulSHR := fpMul.io.exceptionFlags
+
+fpMul2.io.a := 0.U
+fpMul2.io.b := 0.U
+fpMul2.io.roundingMode := 0.U
+fpMul2.io.detectTininess := false.B
+fpMul2SHR := fpMul.io.exceptionFlags
+
 
 // =============================================== //
  
@@ -296,6 +306,7 @@ switch(rocc_state) {
                curOp := 3.U
                counter := 0.U
                src_array := 0.U
+               write_counter := 0.U
                current_dprv := rocc_dprv
                current_dv   := rocc_dv
                resp_rd := rocc_rd
@@ -317,7 +328,10 @@ switch(rocc_state) {
        rocc_busy := false.B
      }.elsewhen(mac_finished && curOp === 2.U)
      {
-         rocc_state := r_return // ** MODIFY RETURN LOGIC ** //
+       rocc_state := r_return 
+     }.elsewhen(exp_finished && curOp === 3.U){
+       rocc_state := r_idle
+       rocc_busy := false.B
      }.otherwise{
        rocc_state := r_busy
      }
@@ -561,7 +575,7 @@ switch(comp_state){
        {
            // y + 1
            fpAdder.io.a := recFNFromFN(outer.expWidth, outer.sigWidth, rocc_interal.out_data_1.bits)
-           fpAdder.io.b := recFNFromFN(outer.expWidth, outer.sigWidth, expValues[0])
+           fpAdder.io.b := recFNFromFN(outer.expWidth, outer.sigWidth, expValues(0))
            term_1 := fpAdder.io.out // Again in recorded FP format
            // y^2
            fpMul.io.a := recFNFromFN(outer.expWidth, outer.sigWidth, rocc_interal.out_data_1.bits)
@@ -569,7 +583,7 @@ switch(comp_state){
            term_2 := fpMul.io.out // 2nd term in recorded FP format     (latch to decouple stages)      
            // y * 1/3!
            fpMul2.io.a := recFNFromFN(outer.expWidth, outer.sigWidth, rocc_interal.out_data_1.bits)
-           fpMul2.io.b := recFNFromFN(outer.expWidth, outer.sigWidth, expValues[3])
+           fpMul2.io.b := recFNFromFN(outer.expWidth, outer.sigWidth, expValues(3))
            term_3 := fpMul2.io.out // 3rd term
 
            comp_state := c_exp2
@@ -580,7 +594,7 @@ switch(comp_state){
         // (term 1) + (term2 * exp[2])
         fpMAC.io.c := term_1
         fpMAC.io.a := term_2
-        fpMAC.io.b := recFNFromFN(outer.expWidth, outer.sigWidth, expValues[2])
+        fpMAC.io.b := recFNFromFN(outer.expWidth, outer.sigWidth, expValues(2))
         term_2 := fpMAC.io.out       
         // y^3 * 1/3!
         fpMul.io.a := term_2
@@ -589,7 +603,7 @@ switch(comp_state){
         
         comp_state := c_exp3
        }
-   is(e_exp3){
+   is(c_exp3){
        fpAdder.io.a := term_2
        fpAdder.io.b := term_3
        e_likeilood := fpAdder.io.out
@@ -605,9 +619,15 @@ switch(comp_state){
             fpMul.io.a := e_likeilood
             fpMul.io.b := recFNFromFN(outer.expWidth, outer.sigWidth, rocc_interal.out_data_2.bits)
             rocc_interal.in_data_w.bits := fNFromRecFN(outer.expWidth, outer.sigWidth, fpMul.io.out)
+            when(rocc_interal.out_data_1.valid)
+              {
+                comp_state := c_exp
+              }.otherwise{
+                comp_state := c_idle
+              }
         }
-
-
+    }.otherwise{
+      comp_state := c_exp_w
     }
   }
 }
@@ -634,6 +654,3 @@ io.mem.req.bits.signed := false.B   // Should not need
 io.mem.req.bits.phys   := false.B   // All acceses are virtual and should be translated
 // ========================================================+++++++============= //
 }
- 
- 
-
