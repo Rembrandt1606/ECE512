@@ -147,7 +147,7 @@ val curr_c_addr     = Reg(UInt(coreMaxAddrBits.W))      // current fifo 3 addres
 val curr_wb_addr  = Reg(UInt(coreMaxAddrBits.W))        // current address we are writing back to
 val counter       =  Reg(UInt(32.W))                    // counter for the number of addresses that have been accessed
 val write_counter = Reg(UInt(32.W))                     // counter for the number of write address we have stored to
-val array_size    = RegInit(10.U(32.W))                     // Stores current size of particle filter (n = 10000) in example
+val array_size    = RegInit(100.U(32.W))                // Stores current size of particle filter (n = 10000) in example
 val resp_rd = Reg(chiselTypeOf(rocc_rd))                // stores return register
 val c_start_addr = Reg(UInt(coreMaxAddrBits.W))         // stores c address for multiply accumulate c += (b x a)
 val b_start_addr = Reg(UInt(coreMaxAddrBits.W))         // stores b address for multiply accumulate c += (b x a)
